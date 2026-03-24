@@ -1,0 +1,137 @@
+name: Coding Agent
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task description or issue URL"
+        required: true
+      target_repo:
+        description: "Owner/repo to work on"
+        required: true
+      branch:
+        description: "Branch name to create"
+        required: true
+      dispatch_id:
+        description: "Registry dispatch ID for status tracking"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  code:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Clone target repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          WORKDIR="/tmp/coding-agent-${{ inputs.dispatch_id || github.run_id }}"
+          rm -rf "$WORKDIR"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ inputs.target_repo }}.git" "$WORKDIR"
+          cd "$WORKDIR"
+          git checkout -b "${{ inputs.branch }}"
+          git config user.email "agent@blanxlait.com"
+          git config user.name "Coding Agent"
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
+
+      - name: Run Claude Code
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          PROMPT="${{ inputs.task }}
+
+          When you are done, commit all changes with a clear commit message."
+
+          printf '%s' "$PROMPT" | claude -p \
+            --dangerously-skip-permissions \
+            --max-turns 35 \
+            --model sonnet
+          EXIT_CODE=$?
+
+          echo "--- Exit code: $EXIT_CODE ---"
+          echo "--- Git log ---"
+          git log --oneline -5
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "FAIL: Claude Code exited with $EXIT_CODE"
+            exit 1
+          fi
+
+      - name: Push branch and create PR
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+
+          COMMITS_AHEAD=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
+          if [ "$COMMITS_AHEAD" -eq 0 ]; then
+            echo "No commits to push — agent made no changes"
+            exit 0
+          fi
+
+          git push origin "${{ inputs.branch }}"
+
+          PR_URL=$(gh pr create \
+            --repo "${{ inputs.target_repo }}" \
+            --head "${{ inputs.branch }}" \
+            --title "$(git log -1 --format=%s)" \
+            --body "Automated by coding agent.
+
+          **Task:** ${{ inputs.task }}
+
+          **Dispatch ID:** ${{ inputs.dispatch_id || 'manual' }}
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+
+          echo "PR created: $PR_URL"
+          echo "PR_URL=$PR_URL" >> "$GITHUB_ENV"
+
+      - name: Send heartbeat
+        if: always()
+        run: |
+          URL="${{ secrets.REGISTRY_URL }}"
+          TOKEN="${{ secrets.HEARTBEAT_TOKEN }}"
+          NAME="${{ secrets.AGENT_NAME }}"
+          ORG_ID="${{ secrets.ORG_ID }}"
+          if [ -n "$URL" ] && [ -n "$TOKEN" ] && [ -n "$NAME" ]; then
+            HEADERS="-H \"Authorization: Bearer $TOKEN\""
+            if [ -n "$ORG_ID" ]; then HEADERS="$HEADERS -H \"X-Org-Id: $ORG_ID\""; fi
+            curl -s -X PUT "$URL/agents/$NAME/heartbeat" $HEADERS || true
+          fi
+
+      - name: Update dispatch status
+        if: always()
+        env:
+          REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+          HEARTBEAT_TOKEN: ${{ secrets.HEARTBEAT_TOKEN }}
+        run: |
+          DISPATCH_ID="${{ inputs.dispatch_id }}"
+          if [ -z "$DISPATCH_ID" ] || [ -z "$REGISTRY_URL" ]; then
+            echo "No dispatch ID or registry URL — skipping status update"
+            exit 0
+          fi
+
+          if [ "${{ job.status }}" = "success" ] && [ -n "${PR_URL:-}" ]; then
+            STATUS="pr_opened"
+          elif [ "${{ job.status }}" = "success" ]; then
+            STATUS="completed"
+          else
+            STATUS="failed"
+          fi
+
+          # JSON-escape the PR URL to avoid malformed payloads
+          ESCAPED_PR_URL=$(printf '%s' "${PR_URL:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+          curl -s -X PATCH "$REGISTRY_URL/agents/dispatch/$DISPATCH_ID" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $HEARTBEAT_TOKEN" \
+            -d "{\"status\": \"$STATUS\", \"githubRunId\": ${{ github.run_id }}, \"prUrl\": \"$ESCAPED_PR_URL\"}" \
+            || echo "Warning: failed to update dispatch status"
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf "${{ env.WORKDIR }}"
